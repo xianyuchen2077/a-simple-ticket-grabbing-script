@@ -1,0 +1,766 @@
+// ========== 全局的轮询相关变量 ==========
+// 全局变量，用于控制轮询（类似weixinQ.js的timerCheck）
+var timerCheck = null;
+var pollAttempts = 0;
+const MAX_POLL_ATTEMPTS = 120; // 最大尝试次数（4分钟：240秒/2秒=120次）
+const POLL_INTERVAL = 2000; // 轮询间隔2秒
+
+// 标志位：确保只有在用户点击标签后才允许生成二维码和轮询
+var isUserClicked = false;
+
+// 存储当前二维码的bizSeq，用于轮询时查询
+var currentBizSeq = null;
+
+// ========== 轮询控制函数 ==========
+
+// 停止轮询（类似weixinQ.js的clearInterval(timerCheck)）
+function stopPolling() {
+    if (timerCheck) {
+        clearInterval(timerCheck);
+        timerCheck = null;
+    }
+}
+
+// 页面状态更新函数
+function updateStatus(message, type) {
+    const statusElement = document.getElementById('status');
+    if (statusElement) {
+        statusElement.innerText = message;
+        statusElement.className = 'status-' + type;
+    }
+}
+
+// 显示重试按钮
+function showRetryButton() {
+    const retryBtn = document.getElementById('retryBtn');
+    if (retryBtn) {
+        retryBtn.style.display = 'block';
+    }
+}
+
+// 扫码成功处理
+function handleScanSuccess(callbackUrl) {
+    // 更新页面状态
+    updateStatus('认证成功', 'success');
+
+    // 如果有回调URL，直接跳转（不显示alert）
+    if (callbackUrl && callbackUrl !== '0') {
+        window.location.href = callbackUrl;
+    }
+}
+
+// 认证失败处理
+function handleScanFailure(errorMessage) {
+    stopPolling();
+    // 显示失败弹窗
+    showErrorModal(errorMessage || '实名认证失败');
+}
+
+// 显示失败弹窗
+function showErrorModal(message) {
+    // 先尝试获取现有弹框
+    var modal = document.getElementById('errorModal');
+    if (!modal) {
+        // 如果不存在，动态创建
+        modal = document.createElement('div');
+        modal.id = 'errorModal';
+        document.body.appendChild(modal);
+    }
+
+
+    // 设置弹框内容，使用内联样式确保兼容性
+    modal.innerHTML = '<div style="background-color: #fff; margin: 15% auto; padding: 30px; border-radius: 8px; width: 90%; max-width: 400px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); text-align: center;">' +
+        '<div style="font-size: 20px; font-weight: bold; color: #dc3545; margin-bottom: 20px;">✗</div>' +
+        '<div style="font-size: 16px; color: #333; margin-bottom: 30px;">' + (message || '实名认证失败') + '</div>' +
+        '<button type="button" style="padding: 10px 30px; background-color: #dc3545; color: #fff; border: none; border-radius: 4px; font-size: 16px; cursor: pointer;" onclick="closeErrorModal()">确定</button>' +
+        '</div>';
+
+    // 显示弹框
+    modal.style.cssText = 'display: block !important; position: fixed !important; z-index: 99999 !important; left: 0 !important; top: 0 !important; width: 100% !important; height: 100% !important; background-color: rgba(0, 0, 0, 0.5) !important; overflow: auto !important;';
+}
+
+// 关闭失败弹窗
+function closeErrorModal() {
+    var modal = document.getElementById('errorModal');
+    if (modal) {
+        modal.style.display = 'none';
+    }
+    // 关闭弹框后刷新二维码
+    setTimeout(function() {
+        makeIdentityQRCode();
+    }, 100);
+}
+
+// 超时处理
+function handleScanTimeout() {
+    // 更新页面状态
+    updateStatus('二维码已过期，点击刷新', 'error');
+
+    // 使用 setTimeout 确保 DOM 已完全渲染
+    setTimeout(function() {
+        createExpiredOverlay();
+    }, 100);
+}
+
+// 创建过期覆盖层
+function createExpiredOverlay() {
+    // 显示过期覆盖层
+    var qrCodeContainer = document.getElementById('qrCodeContainer');
+    if (!qrCodeContainer) {
+        return;
+    }
+
+    // 检查是否已经添加过过期覆盖层
+    var existingOverlay = document.getElementById('qrCodeExpiredOverlay');
+    if (existingOverlay) {
+        return; // 已经存在，不重复添加
+    }
+
+    // 找到实际的二维码图片元素（img 或 canvas）
+    var qrElement = qrCodeContainer.querySelector('img, canvas');
+    if (!qrElement) {
+        // 如果找不到，再等待一下
+        setTimeout(function() {
+            createExpiredOverlay();
+        }, 200);
+        return;
+    }
+
+    // 确保二维码容器是相对定位
+    if (qrCodeContainer.style.position !== 'relative' &&
+        qrCodeContainer.style.position !== 'absolute') {
+        qrCodeContainer.style.position = 'relative';
+    }
+
+    // 使用多种方法获取二维码尺寸，优先使用实际渲染尺寸
+    var width = 0;
+    var height = 0;
+
+    // 方法1: 使用 offsetWidth/offsetHeight（实际渲染尺寸）
+    width = qrElement.offsetWidth;
+    height = qrElement.offsetHeight;
+
+    // 方法2: 如果是img，尝试使用 naturalWidth/naturalHeight
+    if ((width === 0 || height === 0) && qrElement.tagName === 'IMG') {
+        width = qrElement.naturalWidth || qrElement.width || 0;
+        height = qrElement.naturalHeight || qrElement.height || 0;
+    }
+
+    // 方法3: 如果是canvas，使用 width/height 属性
+    if ((width === 0 || height === 0) && qrElement.tagName === 'CANVAS') {
+        width = qrElement.width || 0;
+        height = qrElement.height || 0;
+    }
+
+    // 方法4: 使用 getBoundingClientRect
+    if (width === 0 || height === 0) {
+        var qrRect = qrElement.getBoundingClientRect();
+        width = qrRect.width;
+        height = qrRect.height;
+    }
+
+    // 方法5: 如果还是0，使用容器的尺寸
+    if (width === 0 || height === 0) {
+        var containerRect = qrCodeContainer.getBoundingClientRect();
+        width = containerRect.width || qrCodeContainer.offsetWidth || 200;
+        height = containerRect.height || qrCodeContainer.offsetHeight || 200;
+    }
+
+    // 如果尺寸仍然为0，使用默认值并延迟重试
+    if (width === 0 || height === 0) {
+        width = 200;
+        height = 200;
+    }
+
+    // 重新设计位置计算：使用 getBoundingClientRect 获取精确位置
+    // 计算二维码元素相对于容器的精确位置
+    var qrRect = qrElement.getBoundingClientRect();
+    var containerRect = qrCodeContainer.getBoundingClientRect();
+
+    // 优先使用二维码元素的实际尺寸属性（即使 getBoundingClientRect 返回0）
+    // 方法1: 使用 offsetWidth/offsetHeight（实际渲染尺寸）
+    var finalWidth = qrElement.offsetWidth;
+    var finalHeight = qrElement.offsetHeight;
+
+    // 方法2: 如果是img，尝试使用 naturalWidth/naturalHeight 或 width/height 属性
+    if ((finalWidth === 0 || finalHeight === 0) && qrElement.tagName === 'IMG') {
+        finalWidth = qrElement.naturalWidth || qrElement.width || 0;
+        finalHeight = qrElement.naturalHeight || qrElement.height || 0;
+    }
+
+    // 方法3: 如果是canvas，使用 width/height 属性
+    if ((finalWidth === 0 || finalHeight === 0) && qrElement.tagName === 'CANVAS') {
+        finalWidth = qrElement.width || 0;
+        finalHeight = qrElement.height || 0;
+    }
+
+    // 方法4: 使用之前计算的 width/height（从多种方法获取的）
+    if (finalWidth === 0 || finalHeight === 0) {
+        finalWidth = width;
+        finalHeight = height;
+    }
+
+    // 方法5: 使用 getBoundingClientRect（虽然可能为0，但作为最后备选）
+    if (finalWidth === 0 || finalHeight === 0) {
+        finalWidth = qrRect.width || 0;
+        finalHeight = qrRect.height || 0;
+    }
+
+    // 如果还是0，使用默认值200x200（二维码的标准尺寸）
+    if (finalWidth === 0 || finalHeight === 0) {
+        finalWidth = 200;
+        finalHeight = 200;
+    }
+
+
+    // 计算位置：优先使用 offsetTop/offsetLeft（相对于定位父元素）
+    var top = qrElement.offsetTop;
+    var left = qrElement.offsetLeft;
+
+    // 如果 offsetTop/offsetLeft 不可用，使用 getBoundingClientRect 计算
+    if (isNaN(top) || isNaN(left) || top < 0 || left < 0) {
+        var scrollTop = qrCodeContainer.scrollTop || 0;
+        var scrollLeft = qrCodeContainer.scrollLeft || 0;
+        top = qrRect.top - containerRect.top + scrollTop;
+        left = qrRect.left - containerRect.left + scrollLeft;
+    }
+
+    // 如果位置计算异常，使用0（二维码在容器左上角）
+    if (isNaN(top) || top < 0) top = 0;
+    if (isNaN(left) || left < 0) left = 0;
+
+    // 如果二维码在容器中居中，需要计算居中位置
+    // 检查容器是否有 flex 或 text-align: center 等居中样式
+    var containerStyle = window.getComputedStyle(qrCodeContainer);
+    var isCentered = containerStyle.display === 'flex' ||
+        containerStyle.textAlign === 'center' ||
+        containerStyle.justifyContent === 'center';
+
+    if (isCentered && top === 0 && left === 0) {
+        // 如果容器是居中的，计算二维码的居中位置
+        var containerWidth = containerRect.width || qrCodeContainer.offsetWidth;
+        var containerHeight = containerRect.height || qrCodeContainer.offsetHeight;
+        left = (containerWidth - finalWidth) / 2;
+        top = (containerHeight - finalHeight) / 2;
+    }
+
+
+    // 创建覆盖层
+    var overlay = document.createElement('div');
+    overlay.id = 'qrCodeExpiredOverlay';
+
+
+    // 创建覆盖层，使用精确的二维码尺寸和位置
+    overlay.style.cssText = `
+        position: absolute;
+        top: ${top}px;
+        left: ${left}px;
+        width: ${finalWidth}px;
+        height: ${finalHeight}px;
+        background-color: rgba(0, 0, 0, 0.5);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        cursor: pointer;
+        z-index: 1000;
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+    `;
+
+    // 创建文字内容 - 两行显示
+    var textContainer = document.createElement('div');
+    textContainer.style.cssText = `
+        color: #fff;
+        font-size: 18px;
+        font-weight: bold;
+        text-align: center;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+        padding: 0 10px;
+        line-height: 1.5;
+    `;
+
+    // 第一行：二维码已过期
+    var line1 = document.createElement('div');
+    line1.textContent = smrzQrcodeExpired;
+    line1.style.cssText = 'margin-bottom: 8px;';
+
+    // 第二行：点击刷新
+    var line2 = document.createElement('div');
+    line2.textContent = clickToFlash;
+
+    textContainer.appendChild(line1);
+    textContainer.appendChild(line2);
+    overlay.appendChild(textContainer);
+
+    // 绑定点击事件，点击整个覆盖层都可以刷新
+    overlay.onclick = function() {
+        // 清除覆盖层
+        if (overlay && overlay.parentNode) {
+            overlay.parentNode.removeChild(overlay);
+        }
+        // 重新生成二维码
+        makeIdentityQRCode();
+    };
+
+    // 将覆盖层添加到二维码容器，放在二维码元素之后
+    // 这样可以确保覆盖层和二维码元素在同一个定位上下文中
+    if (qrElement.nextSibling) {
+        qrCodeContainer.insertBefore(overlay, qrElement.nextSibling);
+    } else {
+        qrCodeContainer.appendChild(overlay);
+    }
+}
+
+// 错误处理
+function handleScanError(error) {
+    alert('系统错误，请稍后重试！');
+    updateStatus('系统错误', 'error');
+}
+
+// ========== 轮询检查函数（类似weixinQ.js的getLoginStatus和repeatCheck） ==========
+
+// 开始轮询检查（类似weixinQ.js的repeatCheck函数）
+function repeatCheck(bizSeq) {
+    // 先停止可能存在的旧轮询
+    stopPolling();
+
+    // 保存bizSeq到全局变量
+    currentBizSeq = bizSeq;
+    pollAttempts = 0;
+
+    // 开始定时轮询（类似weixinQ.js的setInterval(getLoginStatus,2000)）
+    timerCheck = setInterval(getLoginStatus, POLL_INTERVAL);
+}
+
+// 获取扫码状态（轮询函数，类似weixinQ.js的getLoginStatus）
+function getLoginStatus() {
+    pollAttempts++;
+
+    // 检查是否有bizSeq
+    if (!currentBizSeq) {
+        // 如果达到最大尝试次数，显示超时提示
+        if (pollAttempts >= MAX_POLL_ATTEMPTS) {
+            stopPolling();
+            handleScanTimeout();
+        }
+        return;
+    }
+    // 获取复选框状态
+    var singleLoginCheckbox = document.querySelector('input[name="singleLogin"]');
+    var singleLoginValue = singleLoginCheckbox ? singleLoginCheckbox.checked : false;
+    var fingerPrint = document.getElementById('fingerPrint').value;
+    var fingerGenPrint = document.getElementById('fingerGenPrint').value;
+    var fingerGenPrint3 = document.getElementById('fingerGenPrint3').value;
+    var deviceName = document.getElementById('deviceName').value;
+
+
+
+    $.ajax({
+        type: "POST",
+        url: '/api/identity/check',
+        data: {
+            bizSeq: currentBizSeq,
+            singleLogin_SMRZ: singleLoginValue,
+            fingerPrint:fingerPrint,
+            fingerGenPrint:fingerGenPrint,
+            fingerGenPrint3:fingerGenPrint3,
+            deviceName:deviceName
+
+        },
+        success: function(data) {
+            // 根据实际的ControllerResult结构判断
+            // ControllerResult结构: {result: "success", msg: "xxx", object: xxx}
+            if (data.result === "success") {
+                // 检查是否是认证失败
+                if (data.msg === "认证失败，返回结果码") {
+                    // 认证失败
+                    var errorMessage = data.object ? String(data.object) : '实名认证失败';
+                    handleScanFailure(errorMessage);
+                    return;
+                }
+
+                if (data.object && data.object !== 0 && data.object !== '0') {
+                    // 扫码成功，有回调URL（类似weixinQ.js的扫码成功处理）
+                    stopPolling();
+                    handleScanSuccess(data.object);
+                } else if (pollAttempts >= MAX_POLL_ATTEMPTS) {
+                    // 超时处理
+                    stopPolling();
+                    handleScanTimeout();
+                } else {
+                    updateStatus(`等待扫码中... ${data.msg || ''} (${pollAttempts}/${MAX_POLL_ATTEMPTS})`, 'waiting');
+                }
+            } else {
+                // 接口返回错误，不停止轮询，继续尝试
+                // 如果达到最大尝试次数，显示超时提示
+                if (pollAttempts >= MAX_POLL_ATTEMPTS) {
+                    stopPolling();
+                    handleScanTimeout();
+                }
+            }
+        },
+        error: function(xhr, status, error) {
+            // 如果达到最大尝试次数，显示超时提示
+            if (pollAttempts >= MAX_POLL_ATTEMPTS) {
+                stopPolling();
+                handleScanTimeout();
+            }
+            // 否则继续尝试，不停止轮询
+        }
+    });
+}
+
+// 手动停止轮询（如果需要）
+function cancelIdentityCheck() {
+    stopPolling();
+    currentBizSeq = null; // 清除bizSeq
+    updateStatus('用户取消认证', 'info');
+}
+
+// ========== 二维码生成相关函数 ==========
+
+// 生成二维码的主函数（类似weixinQ.js的makeCode函数）
+function makeIdentityQRCode() {
+    // 安全检查：确保只有在用户点击标签后才执行
+    if (!isUserClicked) {
+        return;
+    }
+
+    // 先停止可能存在的旧轮询
+    stopPolling();
+
+    // 清除可能存在的过期覆盖层
+    var expiredOverlay = document.getElementById('qrCodeExpiredOverlay');
+    if (expiredOverlay && expiredOverlay.parentNode) {
+        expiredOverlay.parentNode.removeChild(expiredOverlay);
+    }
+
+    // 先保存 SMRZAppid 和 SMRZSeq 的值（在重新设置 innerHTML 之前）
+    var SMRZAppid = $("#SMRZAppid").val();
+    var SMRZSeq = $("#SMRZSeq").val();
+
+    // 如果元素不存在，尝试从 DOM 中查找
+    if (!SMRZAppid) {
+        var appidEl = document.getElementById('SMRZAppid');
+        if (appidEl) SMRZAppid = appidEl.value;
+    }
+    if (!SMRZSeq) {
+        var seqEl = document.getElementById('SMRZSeq');
+        if (seqEl) SMRZSeq = seqEl.value;
+    }
+
+    var url = '/api/identity/identityVerification_for_login?mode=mode_Login';
+    if (SMRZAppid) url += '&appId=' + encodeURIComponent(SMRZAppid);
+    if (SMRZSeq) url += '&seq=' + encodeURIComponent(SMRZSeq);
+
+    // 使用fetch请求接口（类似weixinQ.js的$.ajax请求）
+    fetch(url)
+        .then(response => {
+            if (!response.ok) {
+                throw new Error('网络响应不正常: ' + response.status);
+            }
+
+            return response.text();
+        })
+        .then(text => {
+
+            if (text.startsWith('<')) {
+                var smrzBox = document.querySelector('.smrzBox');
+                if (smrzBox) {
+                    smrzBox.innerHTML = '<div style="padding: 20px;"><h4>返回HTML内容:</h4><pre style="background: #f5f5f5; padding: 15px; border-radius: 4px; max-height: 300px; overflow: auto;">' + text.substring(0, 1000) + (text.length > 1000 ? '...' : '') + '</pre></div>';
+                }
+            } else {
+                try {
+                    var data = JSON.parse(text);
+
+                    if (data.success === true && data.qrCode) {
+                        // 提取bizSeq
+                        var bizSeq = data.bizSeq;
+                        if (!bizSeq && data.fullResponse && data.fullResponse.bizPackage) {
+                            bizSeq = data.fullResponse.bizPackage.bizSeq;
+                        }
+
+                        if (!bizSeq) {
+                            var smrzBox = document.querySelector('.smrzBox');
+                            if (smrzBox) {
+                                smrzBox.innerHTML = '<div style="color: red; padding: 20px;">二维码生成失败：缺少bizSeq参数</div>';
+                            }
+                            return;
+                        }
+
+                        var smrzBox = document.querySelector('.smrzBox');
+                        if (smrzBox) {
+                            // 重新设置 innerHTML 时，保留 SMRZAppid 和 SMRZSeq 的 input 元素
+                            var hiddenInputs = '';
+                            if (SMRZAppid) {
+                                hiddenInputs += '<input type="hidden" id="SMRZAppid" value="' + SMRZAppid.replace(/"/g, '&quot;') + '">';
+                            }
+                            if (SMRZSeq) {
+                                hiddenInputs += '<input type="hidden" id="SMRZSeq" value="' + SMRZSeq.replace(/"/g, '&quot;') + '">';
+                            }
+
+                            smrzBox.innerHTML = `
+                                <p class="son" id="qrcode">
+                                    ${hiddenInputs}
+                                </p>
+                                <div id="qrCodeContainer" style="text-align: center; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 250px;"></div>
+    
+                            `;
+
+                            // 生成二维码（类似weixinQ.js的qrcode.makeCode）
+                            generateQRCode(data.qrCode);
+
+                            // 生成二维码后，开始轮询检查扫码状态（类似weixinQ.js的repeatCheck()）
+                            // 注意：只有在这里，二维码已经成功生成后，才会开始轮询
+                            // 传递bizSeq给repeatCheck函数
+                            repeatCheck(bizSeq);
+                        }
+                    } else {
+                        var smrzBox = document.querySelector('.smrzBox');
+                        if (smrzBox) {
+                            smrzBox.innerHTML = '<div style="padding: 20px;"><h4>返回JSON数据:</h4><pre style="background: #f5f5f5; padding: 15px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word;">' + JSON.stringify(data, null, 2) + '</pre></div>';
+                        }
+                    }
+                } catch (jsonError) {
+                    var smrzBox = document.querySelector('.smrzBox');
+                    if (smrzBox) {
+                        smrzBox.innerHTML = '<div style="padding: 20px;"><h4>返回文本内容:</h4><pre style="background: #f5f5f5; padding: 15px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word;">' + text + '</pre></div>';
+                    }
+                }
+            }
+        })
+        .catch(error => {
+            var smrzBox = document.querySelector('.smrzBox');
+            if (smrzBox) {
+                smrzBox.innerHTML = '<div style="color: red; padding: 20px;">请求出错: ' + error.message + '</div>';
+            }
+        });
+}
+
+// 在二维码中心添加logo的函数
+function addLogoToQRCode(container) {
+    if (!container) {
+        return;
+    }
+
+    // 查找二维码元素（可能是img或canvas）
+    var qrElement = container.querySelector('img, canvas');
+    if (!qrElement) {
+        return;
+    }
+
+    // 检查是否已经添加过logo
+    if (container.querySelector('.qr-logo')) {
+        return;
+    }
+
+    // 获取二维码的实际尺寸
+    var qrWidth = qrElement.offsetWidth || qrElement.width || 200;
+    var qrHeight = qrElement.offsetHeight || qrElement.height || 200;
+
+    // 计算logo尺寸（高度为二维码高度的20%）
+    var logoHeight = qrHeight * 0.2;
+    var logoWidth = logoHeight; // 保持正方形比例
+
+    // 创建logo图片元素
+    var logoImg = document.createElement('img');
+    logoImg.src = '/res/Logo_smrz.png';
+    logoImg.className = 'qr-logo';
+    logoImg.alt = '实名认证';
+    logoImg.style.position = 'absolute';
+    logoImg.style.top = '50%';
+    logoImg.style.left = '50%';
+    logoImg.style.transform = 'translate(-50%, -50%)';
+    logoImg.style.width = logoWidth + 'px';
+    logoImg.style.height = logoHeight + 'px';
+
+    // 确保容器使用相对定位
+    if (container.style.position !== 'relative' && container.style.position !== 'absolute') {
+        container.style.position = 'relative';
+    }
+
+    // 将logo添加到容器
+    container.appendChild(logoImg);
+}
+
+// 生成二维码的函数
+function generateQRCode(qrCodeData) {
+    var container = document.getElementById('qrCodeContainer');
+    if (container && qrCodeData) {
+        try {
+            if (qrCodeData.startsWith('data:image') || qrCodeData.match(/^[A-Za-z0-9+/=]+$/)) {
+                var img = document.createElement('img');
+                if (qrCodeData.startsWith('data:')) {
+                    img.src = qrCodeData;
+                } else {
+                    img.src = 'data:image/png;base64,' + qrCodeData;
+                }
+                img.alt = '身份验证二维码';
+                img.style.maxWidth = '100%';
+                img.style.height = 'auto';
+                // 立即移除 title 属性（如果存在）
+                img.removeAttribute('title');
+                img.onload = function() {
+                    // 移除 title 属性，防止鼠标悬停时显示二维码数据
+                    img.removeAttribute('title');
+                    // 多次检查确保移除
+                    setTimeout(function() {
+                        img.removeAttribute('title');
+                    }, 50);
+                    setTimeout(function() {
+                        img.removeAttribute('title');
+                    }, 200);
+                    // 二维码图片加载完成后，添加logo
+                    setTimeout(function() {
+                        addLogoToQRCode(container);
+                    }, 100);
+                };
+                img.onerror = function() {
+                    generateQRCodeFromText(qrCodeData);
+                };
+                container.appendChild(img);
+                // 添加后立即再次检查
+                setTimeout(function() {
+                    img.removeAttribute('title');
+                }, 10);
+            } else {
+                generateQRCodeFromText(qrCodeData);
+            }
+        } catch (e) {
+            container.innerHTML = '<p style="color: red;">二维码生成失败，请刷新页面重试</p>';
+        }
+    }
+}
+
+// 从文本生成二维码的函数
+function generateQRCodeFromText(text) {
+    var container = document.getElementById('qrCodeContainer');
+    if (container) {
+        container.innerHTML = '';
+    }
+
+    if (typeof QRCode !== 'undefined') {
+        var qr = new QRCode(container, {
+            text: text,
+            width: 200,
+            height: 200,
+            colorDark: '#000000',
+            colorLight: '#ffffff',
+            correctLevel: QRCode.CorrectLevel.L
+        });
+        // 移除二维码元素的 title 属性，防止鼠标悬停时显示数据
+        // 使用多次检查和 MutationObserver 确保彻底移除
+        function removeTitleAttributes() {
+            var qrElements = container.querySelectorAll('canvas, img');
+            qrElements.forEach(function(el) {
+                if (el.hasAttribute('title')) {
+                    el.removeAttribute('title');
+                }
+            });
+        }
+        // 立即移除
+        removeTitleAttributes();
+        // 延迟多次检查（QRCode 库可能在生成后异步设置 title）
+        setTimeout(removeTitleAttributes, 50);
+        setTimeout(removeTitleAttributes, 100);
+        setTimeout(removeTitleAttributes, 200);
+        setTimeout(removeTitleAttributes, 500);
+        // 使用 MutationObserver 持续监听 title 属性的变化
+        if (typeof MutationObserver !== 'undefined') {
+            var observer = new MutationObserver(function(mutations) {
+                removeTitleAttributes();
+            });
+            observer.observe(container, {
+                attributes: true,
+                attributeFilter: ['title'],
+                subtree: true,
+                childList: true
+            });
+            // 5秒后停止观察（二维码应该已经生成完成）
+            setTimeout(function() {
+                observer.disconnect();
+            }, 5000);
+        }
+
+        // 二维码生成完成后，添加logo
+        // 延迟执行以确保二维码元素已完全渲染
+        setTimeout(function() {
+            addLogoToQRCode(container);
+        }, 300);
+    } else {
+        var img = document.createElement('img');
+        if (text.startsWith('data:')) {
+            img.src = text;
+        } else {
+            img.src = 'data:image/png;base64,' + text;
+        }
+        img.alt = '身份验证二维码';
+        img.style.maxWidth = '100%';
+        img.style.height = 'auto';
+        // 立即移除 title 属性（如果存在）
+        img.removeAttribute('title');
+        img.onload = function() {
+            // 移除 title 属性，防止鼠标悬停时显示二维码数据
+            img.removeAttribute('title');
+            // 多次检查确保移除
+            setTimeout(function() {
+                img.removeAttribute('title');
+            }, 50);
+            setTimeout(function() {
+                img.removeAttribute('title');
+            }, 200);
+            // 二维码图片加载完成后，添加logo
+            setTimeout(function() {
+                addLogoToQRCode(container);
+            }, 100);
+        };
+        if (container) {
+            container.appendChild(img);
+            // 添加后立即再次检查
+            setTimeout(function() {
+                img.removeAttribute('title');
+            }, 10);
+        }
+    }
+}
+
+// ========== 页面加载时绑定点击事件（类似weixinQ.js的$(function() {...})） ==========
+// 页面加载完成后，绑定标签点击事件，确保只在点击时才生成二维码和开始轮询
+$(function () {
+    // 确保页面加载时停止任何可能的轮询
+    stopPolling();
+    // 重置用户点击标志
+    isUserClicked = false;
+    // 清除bizSeq
+    currentBizSeq = null;
+
+    $(".dttab h3").click(function () {
+        var dom = $(this).data("id");
+        // 判断是否是实名认证相关的标签（根据实际页面结构调整选择器）
+        // 类似weixinQ.js的if($("#"+dom).hasClass("wxsmdl"))
+        if ($("#" + dom).hasClass("smrzBox") || $("#" + dom).hasClass("smrzmdl") || dom === "smrz") {
+            // 先停止可能存在的旧轮询
+            stopPolling();
+            // 设置用户点击标志，允许生成二维码和轮询
+            isUserClicked = true;
+            // 生成二维码（类似weixinQ.js的makeCode()）
+            // 注意：只有在用户主动点击标签时才会执行这里
+            makeIdentityQRCode();
+        } else {
+            // 切换到其他标签时，停止轮询（类似weixinQ.js的clearInterval(timerCheck)）
+            stopPolling();
+            // 重置用户点击标志
+            isUserClicked = false;
+            // 清除bizSeq
+            currentBizSeq = null;
+        }
+        // 切换标签的显示状态
+        $(this).addClass("active").siblings().removeClass("active");
+        $("#" + dom).addClass("show").siblings().removeClass("show");
+    });
+
+    // 确保页面加载时，即使有默认激活的标签，也不会自动执行
+    // 只有用户主动点击才会执行
+});

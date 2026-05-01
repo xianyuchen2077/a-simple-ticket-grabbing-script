@@ -7,6 +7,89 @@ from selenium.webdriver.common.action_chains import ActionChains
 import time
 from selenium.common.exceptions import StaleElementReferenceException
 
+# ===== 登录检测启发式函数 =====
+COMMON_LOGIN_TEXTS = ["登录", "登 录", "登录/注册", "Sign in", "Sign In", "Sign in to", "Log in", "Log In", "Login", "Sign‑in"]
+COMMON_LOGIN_URL_PARTS = ["login", "signin", "sign-in", "auth", "account", "accounts", "oauth"]
+
+
+def needs_login(driver, timeout=5):
+    """
+    判断当前页面是否需要登录。
+    返回 (bool, reason)。
+    启发式检测：URL、密码输入框、登录文字、用户名/邮箱字段、是否存在头像/个人区。
+    """
+    try:
+        url = (driver.current_url or "").lower()
+    except Exception:
+        url = ""
+
+    # 1) URL 检查
+    for part in COMMON_LOGIN_URL_PARTS:
+        if part in url:
+            return True, f"url contains '{part}'"
+
+    # 2) 密码输入框（强信号）
+    try:
+        pw = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        if pw:
+            return True, "found input[type=password]"
+    except Exception:
+        pass
+
+    # 3) 登录按钮/链接文字
+    try:
+        btns = driver.find_elements(By.XPATH, "//button|//a|//input[@type='submit']|//input[@type='button']")
+        for b in btns:
+            try:
+                text = (b.text or b.get_attribute("value") or b.get_attribute("innerText") or "").strip()
+            except Exception:
+                text = ""
+            if not text:
+                continue
+            for key in COMMON_LOGIN_TEXTS:
+                if key.lower() in text.lower():
+                    return True, f"found button/link text '{text}'"
+    except Exception:
+        pass
+
+    # 4) 常见用户名/邮箱字段
+    try:
+        suspects = driver.find_elements(By.XPATH,
+            "//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'user')]|"
+            "//input[contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'user')]|"
+            "//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'email')]|"
+            "//input[contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'email')]")
+        if suspects:
+            return True, "found username/email input"
+    except Exception:
+        pass
+
+    # 5) 否定信号：用户头像/个人中心存在则通常已登录
+    try:
+        avatar_selectors = [
+            "//img[contains(@alt,'avatar') or contains(@alt,'头像') or contains(@class,'avatar') or contains(@class,'profile') ]",
+            "//*[contains(@aria-label,'account') or contains(@aria-label,'个人') or contains(@aria-label,'profile')]",
+            "//*[contains(@title,'账号') or contains(@title,'个人') or contains(@title,'profile')]",
+            "//*[contains(@class,'user') and (name()!='input')]"
+        ]
+        for sel in avatar_selectors:
+            els = driver.find_elements(By.XPATH, sel)
+            if els:
+                return False, "found profile/avatar element"
+    except Exception:
+        pass
+
+    # 6) 基于 body 文本做弱判断
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text[:3000].lower()
+        for key in COMMON_LOGIN_TEXTS:
+            if key.lower() in body_text:
+                return True, f"body contains login text '{key}'"
+    except Exception:
+        pass
+
+    return False, "no strong login indicators found"
+
 def open_chrome():
     chrome_options = Options()
 
@@ -144,6 +227,13 @@ def _is_date_active(driver, index):
     except StaleElementReferenceException:
         return False
 
+def _venue_page_ready(driver):
+    """判断场地页面是否已经完成基础加载。"""
+    try:
+        return bool(driver.find_elements(By.XPATH, "//div[contains(@class,'date-item')]") )
+    except Exception:
+        return False
+
 def wait_for_time_stable(driver, timeout=6):
     start = time.time()
     last = ""
@@ -159,6 +249,26 @@ def wait_for_time_stable(driver, timeout=6):
         # time.sleep(0.1)
         time.sleep(0.05)
 
+    return False
+
+def wait_for_verifybox_closed(driver, timeout=300, poll_interval=0.2):
+    print("检测到安全验证时，等待你手动完成...")
+    start = time.time()
+
+    while time.time() - start < timeout:
+        try:
+            boxes = driver.find_elements(By.CSS_SELECTOR, ".verifybox")
+            visible_boxes = [box for box in boxes if box.is_displayed()]
+            if not visible_boxes:
+                print("安全验证已完成，继续执行。")
+                return True
+        except Exception:
+            print("安全验证已完成，继续执行。")
+            return True
+
+        time.sleep(poll_interval)
+
+    print("等待安全验证超时，继续执行后续步骤。")
     return False
 
 def reserve_venue(driver, wait):
@@ -180,32 +290,41 @@ def reserve_venue(driver, wait):
 
     # ===== 时间优先级 =====
     priority_times = [
-        "18:00~20:00",
-        "16:00~18:00",
+        # "18:00~20:00",
+        # "16:00~18:00",
         "20:00~22:00",
-        "10:00~12:00",
-        "08:00~10:00",
+        # "10:00~12:00",
+        # "08:00~10:00",
         # "07:00~08:00",
     ]
 
+    force_reload = not _venue_page_ready(driver)
+
     # ===== 开抢循环 =====
-    for i in range(2):
+    for i in range(100):
         try:
             print(f"\n 第{i+1}次")
 
-            # 用 JS 刷新更快
-            driver.execute_script("location.reload()")
+            # 仅在页面没加载出来或上次失败后刷新
+            if force_reload:
+                driver.execute_script("location.reload()")
 
-            wait.until(EC.presence_of_element_located(
-                (By.XPATH, "//div[contains(@class,'date-item')]")
-            ))
+                wait.until(EC.presence_of_element_located(
+                    (By.XPATH, "//div[contains(@class,'date-item')]")
+                ))
+
+                force_reload = False
+            else:
+                print("页面已加载，跳过刷新")
 
             # 选第4天
             if not click_4th_date(driver, wait):
+                force_reload = True
                 continue
 
             # 等时间加载稳定
             if not wait_for_time_stable(driver):
+                force_reload = True
                 continue
 
             sites = driver.find_elements(By.XPATH, "//div[contains(@class,'sites-item')]")
@@ -230,6 +349,7 @@ def reserve_venue(driver, wait):
 
             if not selected:
                 print("没有匹配时间")
+                force_reload = True
                 continue
 
             print("找到时间:", selected.text)
@@ -265,12 +385,45 @@ def reserve_venue(driver, wait):
             driver.execute_script("arguments[0].click();", confirm_btn)
             print("点击确认")
 
+            wait_for_verifybox_closed(driver)
+
+            radio_btn = wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//input[@type='radio' and @value='d467ef62f7ca439fb2445e040a2ab977']/ancestor::span[contains(@class,'el-radio__input')]")
+            ))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", radio_btn)
+            try:
+                ActionChains(driver).move_to_element(radio_btn).pause(0.03).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].click();", radio_btn)
+            print("选择发票抬头")
+
+            pay_btn = wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//div[contains(@class,'qd1') and normalize-space(.)='去支付']")
+            ))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pay_btn)
+            try:
+                ActionChains(driver).move_to_element(pay_btn).pause(0.03).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].click();", pay_btn)
+            print("点击去支付")
+
+            wx_btn = wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//img[@alt='微信' and contains(@src,'wx.png') and @onclick=\"pay('0201')\"]")
+            ))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", wx_btn)
+            try:
+                ActionChains(driver).move_to_element(wx_btn).pause(0.03).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].click();", wx_btn)
+            print("点击微信支付")
+
             print("🎉 成功进入下单！")
 
             return True
 
         except Exception as e:
             print("⚠️ 异常:", e)
+            force_reload = True
             time.sleep(0.1)
 
     print("抢票失败")
@@ -291,11 +444,30 @@ if __name__ == "__main__":
     driver.execute_script("window.location.hash = '#/home'")
 
     # ④ 再等前端渲染
-    time.sleep(0.05)
+    time.sleep(0.1)
 
     # ⑤ 打印调试信息（一定要留）
     print("当前URL:", driver.current_url)
     print("页面标题:", driver.title)
+
+    # ===== 在继续导航前检查是否需要登录 =====
+    need, reason = needs_login(driver, timeout=5)
+    print("需要登录:", need, "原因:", reason)
+    if need:
+        print("检测到需要登录，请在打开的浏览器中完成登录。等待登录中（最多 300s）...")
+        max_wait = 300
+        start_t = time.time()
+        while time.time() - start_t < max_wait:
+            time.sleep(2)
+            try:
+                need2, r2 = needs_login(driver, timeout=2)
+            except Exception:
+                need2, r2 = True, "error during check"
+            if not need2:
+                print("检测到已登录，继续执行。")
+                break
+        else:
+            print("等待登录超时，继续执行（后续步骤可能因未登录失败）")
 
     success = navigate_to_venue(driver, wait)
 
